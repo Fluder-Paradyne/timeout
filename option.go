@@ -24,8 +24,6 @@ func WithResponse(h gin.HandlerFunc) Option {
 	}
 }
 
-// Soft timeout is the default behavior; no extra options are required.
-
 func defaultResponse(c *gin.Context) {
 	c.String(http.StatusRequestTimeout, http.StatusText(http.StatusRequestTimeout))
 }
