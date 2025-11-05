@@ -126,7 +126,9 @@ func New(opts ...Option) gin.HandlerFunc {
 				tw.ResponseWriter.WriteHeader(tw.code)
 			}
 			if buffer.Len() > 0 {
-				_, _ = tw.ResponseWriter.Write(buffer.Bytes())
+				if _, err := tw.ResponseWriter.Write(buffer.Bytes()); err != nil {
+					panic(err)
+				}
 			}
 			tw.FreeBuffer()
 			bufPool.Put(buffer)
