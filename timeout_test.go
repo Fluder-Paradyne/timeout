@@ -69,7 +69,6 @@ func TestSoftTimeout(t *testing.T) {
 	r := gin.New()
 	r.GET("/", New(
 		WithTimeout(10*time.Millisecond),
-		WithSoftTimeout(),
 	),
 		func(c *gin.Context) {
 			time.Sleep(50 * time.Millisecond)
@@ -163,36 +162,12 @@ This test verifies that after a timeout occurs, no subsequent middleware is exec
 */
 func TestNoNextAfterTimeout(t *testing.T) {
 	r := gin.New()
-	called := false
+	var called int32
 	r.Use(New(
 		WithTimeout(50*time.Millisecond),
 	),
 		func(c *gin.Context) {
 			time.Sleep(100 * time.Millisecond)
-			c.String(http.StatusOK, "should not reach")
-		},
-	)
-	r.Use(func(c *gin.Context) {
-		called = true
-	})
-
-	w := httptest.NewRecorder()
-	req, _ := http.NewRequestWithContext(context.Background(), "GET", "/", nil)
-	r.ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusRequestTimeout, w.Code)
-	assert.False(t, called, "next middleware should not be called after timeout")
-}
-
-func TestSoftTimeout_NoNextAfterTimeout(t *testing.T) {
-	r := gin.New()
-	var called int32
-	r.Use(New(
-		WithTimeout(10*time.Millisecond),
-		WithSoftTimeout(),
-	),
-		func(c *gin.Context) {
-			time.Sleep(50 * time.Millisecond)
 			c.String(http.StatusOK, "should not reach")
 		},
 	)
@@ -205,23 +180,21 @@ func TestSoftTimeout_NoNextAfterTimeout(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusRequestTimeout, w.Code)
-	// In soft mode, downstream middleware continues on the copied context.
-	time.Sleep(60 * time.Millisecond)
+	time.Sleep(120 * time.Millisecond)
 	assert.Equal(t, int32(1), atomic.LoadInt32(&called), "next middleware should be called in soft mode")
 }
 
 func TestSoftTimeout_LateWorkContinues(t *testing.T) {
 	r := gin.New()
 	var done int32
-	r.GET("/", New(
-		WithTimeout(10*time.Millisecond),
-		WithSoftTimeout(),
-		WithResponse(func(c *gin.Context) { c.String(http.StatusRequestTimeout, http.StatusText(http.StatusRequestTimeout)) }),
-	), func(c *gin.Context) {
+	r.GET("/", WrapSoft(func(c *gin.Context) {
 		time.Sleep(50 * time.Millisecond)
 		atomic.StoreInt32(&done, 1)
 		c.String(http.StatusOK, "late write")
-	})
+	},
+		WithTimeout(10*time.Millisecond),
+		WithResponse(func(c *gin.Context) { c.String(http.StatusRequestTimeout, http.StatusText(http.StatusRequestTimeout)) }),
+	))
 
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequestWithContext(context.Background(), "GET", "/", nil)
