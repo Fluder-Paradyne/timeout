@@ -56,8 +56,21 @@ func New(opts ...Option) gin.HandlerFunc {
 		panicChan := make(chan panicInfo, 1)
 
 		// Soft timeout: run the whole chain on a copied context by stepping remaining handlers; no cancel; drop late writes.
-		cc := *c
+		cc := c.Copy()
 		cc.Writer = tw
+		// Read original handlers and index from the incoming context
+		origRV := reflect.ValueOf(c).Elem()
+		origHandlersField := origRV.FieldByName("handlers")
+		origIndexField := origRV.FieldByName("index")
+		handlers := reflect.NewAt(origHandlersField.Type(), unsafe.Pointer(origHandlersField.UnsafeAddr())).Elem().Interface().(gin.HandlersChain)
+		idx := int(reflect.NewAt(origIndexField.Type(), unsafe.Pointer(origIndexField.UnsafeAddr())).Elem().Int())
+		// Populate the copied context with the same chain/index so c.Next() inside handlers works
+		ccRV := reflect.ValueOf(cc).Elem()
+		ccHandlersField := ccRV.FieldByName("handlers")
+		ccIndexField := ccRV.FieldByName("index")
+		reflect.NewAt(ccHandlersField.Type(), unsafe.Pointer(ccHandlersField.UnsafeAddr())).Elem().Set(reflect.ValueOf(handlers))
+		reflect.NewAt(ccIndexField.Type(), unsafe.Pointer(ccIndexField.UnsafeAddr())).Elem().SetInt(int64(idx))
+
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -66,13 +79,8 @@ func New(opts ...Option) gin.HandlerFunc {
 				}
 				finish <- struct{}{}
 			}()
-			rv := reflect.ValueOf(&cc).Elem()
-			handlersField := rv.FieldByName("handlers")
-			indexField := rv.FieldByName("index")
-			handlers := reflect.NewAt(handlersField.Type(), unsafe.Pointer(handlersField.UnsafeAddr())).Elem().Interface().(gin.HandlersChain)
-			idx := int(reflect.NewAt(indexField.Type(), unsafe.Pointer(indexField.UnsafeAddr())).Elem().Int())
 			for i := idx + 1; i < len(handlers); i++ {
-				handlers[i](&cc)
+				handlers[i](cc)
 			}
 		}()
 
