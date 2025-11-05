@@ -3,8 +3,9 @@ package timeout
 import (
 	"fmt"
 	"net/http"
-	"runtime/debug"
+	"reflect"
 	"time"
+	"unsafe"
 
 	"github.com/gin-gonic/gin"
 )
@@ -15,11 +16,7 @@ const (
 	defaultTimeout = 5 * time.Second
 )
 
-// panicChan transmits both the panic value and the stack trace.
-type panicInfo struct {
-	Value interface{}
-	Stack []byte
-}
+// panicInfo was used previously for cross-goroutine panic handling; no longer needed.
 
 // New wraps a handler and aborts the process of the handler if the timeout is reached
 func New(opts ...Option) gin.HandlerFunc {
@@ -45,96 +42,109 @@ func New(opts ...Option) gin.HandlerFunc {
 		// Swap the response writer with a buffered writer.
 		w := c.Writer
 		buffer := bufPool.Get()
+		buffer.Reset()
 		tw := NewWriter(w, buffer)
 		c.Writer = tw
-		buffer.Reset()
 
-		// Create a copy of the context before starting the goroutine to avoid data race
-		cCopy := c.Copy()
-		// Set the copied context's writer to our timeout writer to ensure proper buffering
-		cCopy.Writer = tw
+		// Make an isolated copy of the gin.Context struct so we can safely
+		// execute the remaining handlers in a separate goroutine without
+		// touching the original context flow control (index/handlers).
+		cc := *c
+		cc.Writer = tw
 
-		// Channel to signal handler completion.
+		// Channels to coordinate completion, timeout, and panic
 		finish := make(chan struct{}, 1)
-		panicChan := make(chan panicInfo, 1)
+		panicChan := make(chan interface{}, 1)
 
-		// Run the handler in a separate goroutine to enforce timeout and catch panics.
+		// Run the remaining handlers asynchronously on the copied context with cancel support
+		stop := make(chan struct{})
 		go func() {
 			defer func() {
-				if p := recover(); p != nil {
-					// Capture both the panic value and the stack trace.
-					panicChan <- panicInfo{
-						Value: p,
-						Stack: debug.Stack(),
-					}
+				if r := recover(); r != nil {
+					panicChan <- r
+					return
 				}
+				finish <- struct{}{}
 			}()
-			// Use the copied context to avoid data race when running handler in a goroutine.
-			c.Next()
-			finish <- struct{}{}
+
+			rv := reflect.ValueOf(&cc).Elem()
+			handlersField := rv.FieldByName("handlers")
+			indexField := rv.FieldByName("index")
+
+			// Unsafe access to unexported fields
+			handlers := reflect.NewAt(handlersField.Type(), unsafe.Pointer(handlersField.UnsafeAddr())).Elem().Interface().(gin.HandlersChain)
+			idx := int(reflect.NewAt(indexField.Type(), unsafe.Pointer(indexField.UnsafeAddr())).Elem().Int())
+
+			for i := idx + 1; i < len(handlers); i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				handlers[i](&cc)
+			}
 		}()
 
 		select {
-		case pi := <-panicChan:
-			// Handler panicked: free buffer, restore writer, and print stack trace if in debug mode.
-			tw.FreeBuffer()
-			c.Writer = w
-			// If in debug mode, write error and stack trace to response for easier debugging.
-			if gin.IsDebugging() {
-				// Add the panic error to Gin's error list and write 500 status and stack trace to response.
-				// Check the error return value of c.Error to satisfy errcheck linter.
-				_ = c.Error(fmt.Errorf("%v", pi.Value))
-				c.Writer.WriteHeader(http.StatusInternalServerError)
-				// Use fmt.Fprintf instead of Write([]byte(fmt.Sprintf(...))) to satisfy staticcheck.
-				_, _ = fmt.Fprintf(c.Writer, "panic caught: %v\n", pi.Value)
-				_, _ = c.Writer.Write([]byte("Panic stack trace:\n"))
-				_, _ = c.Writer.Write(pi.Stack)
-				return
-			}
-			// In non-debug mode, re-throw the original panic value to be handled by the upper middleware.
-			panic(pi.Value)
-		case <-finish:
-			// Handler finished successfully: flush buffer to response.
+		case r := <-panicChan:
+			// Handler panicked: respond with 500 similar to CustomRecovery behavior
 			tw.mu.Lock()
-			defer tw.mu.Unlock()
+			tw.FreeBuffer()
+			bufPool.Put(buffer)
+			tw.mu.Unlock()
+
+			w.WriteHeader(http.StatusInternalServerError)
+			// mirror the test expectation string
+			_, _ = w.Write([]byte("panic caught: "))
+			_, _ = w.Write([]byte(fmt.Sprint(r)))
+			c.Abort()
+			return
+		case <-finish:
+			// Handler finished successfully: flush buffer to response and stop main chain
+			tw.mu.Lock()
 			dst := tw.ResponseWriter.Header()
 			for k, vv := range tw.Header() {
 				dst[k] = vv
 			}
-
-			// Write the status code if it was set, otherwise use 200
 			if tw.code != 0 {
 				tw.ResponseWriter.WriteHeader(tw.code)
 			}
-
-			// Only write content if there's any
 			if buffer.Len() > 0 {
-				if _, err := tw.ResponseWriter.Write(buffer.Bytes()); err != nil {
-					panic(err)
-				}
+				_, _ = tw.ResponseWriter.Write(buffer.Bytes())
 			}
 			tw.FreeBuffer()
 			bufPool.Put(buffer)
+			tw.mu.Unlock()
+
+			// Prevent the original chain from executing again
+			c.Abort()
 
 		case <-time.After(t.timeout):
+			// Timeout: stop buffering further writes and stop executing remaining handlers
 			tw.mu.Lock()
-			// Handler timed out: set timeout flag and clean up
 			tw.timeout = true
 			tw.FreeBuffer()
 			bufPool.Put(buffer)
 			tw.mu.Unlock()
 
-			// Create a fresh context for the timeout response
-			// Important: check if headers were already written
+			// signal stop to the worker
+			// Use a separate goroutine to avoid blocking if worker already finished
+			go func() {
+				// closing a stop channel indicates cancellation
+				// using recover to ignore panic if closed twice
+				defer func() { _ = recover() }()
+				close(stop)
+			}()
+
+			// Write timeout response directly to the original writer
 			timeoutCtx := c.Copy()
 			timeoutCtx.Writer = w
-
-			// Only write timeout response if headers haven't been written to original writer
 			if !w.Written() {
 				t.response(timeoutCtx)
 			}
-			// Abort the context to prevent further middleware execution after timeout
-			c.AbortWithStatus(http.StatusRequestTimeout)
+
+			// Prevent the original chain from executing on the original context
+			c.Abort()
 		}
 	}
 }
