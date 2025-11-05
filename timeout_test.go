@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -54,6 +55,25 @@ func TestWithoutTimeout(t *testing.T) {
 		WithTimeout(-1*time.Microsecond),
 	),
 		emptySuccessResponse,
+	)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), "GET", "/", nil)
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusRequestTimeout, w.Code)
+	assert.Equal(t, http.StatusText(http.StatusRequestTimeout), w.Body.String())
+}
+
+func TestSoftTimeout(t *testing.T) {
+	r := gin.New()
+	r.GET("/", New(
+		WithTimeout(10*time.Millisecond),
+	),
+		func(c *gin.Context) {
+			time.Sleep(50 * time.Millisecond)
+			c.String(http.StatusOK, "")
+		},
 	)
 
 	w := httptest.NewRecorder()
@@ -142,7 +162,7 @@ This test verifies that after a timeout occurs, no subsequent middleware is exec
 */
 func TestNoNextAfterTimeout(t *testing.T) {
 	r := gin.New()
-	called := false
+	var called int32
 	r.Use(New(
 		WithTimeout(50*time.Millisecond),
 	),
@@ -152,7 +172,7 @@ func TestNoNextAfterTimeout(t *testing.T) {
 		},
 	)
 	r.Use(func(c *gin.Context) {
-		called = true
+		atomic.StoreInt32(&called, 1)
 	})
 
 	w := httptest.NewRecorder()
@@ -160,7 +180,32 @@ func TestNoNextAfterTimeout(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusRequestTimeout, w.Code)
-	assert.False(t, called, "next middleware should not be called after timeout")
+	time.Sleep(120 * time.Millisecond)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&called), "next middleware should be called in soft mode")
+}
+
+func TestSoftTimeout_LateWorkContinues(t *testing.T) {
+	r := gin.New()
+	var done int32
+	r.GET("/", WrapSoft(func(c *gin.Context) {
+		time.Sleep(50 * time.Millisecond)
+		atomic.StoreInt32(&done, 1)
+		c.String(http.StatusOK, "late write")
+	},
+		WithTimeout(10*time.Millisecond),
+		WithResponse(func(c *gin.Context) { c.String(http.StatusRequestTimeout, http.StatusText(http.StatusRequestTimeout)) }),
+	))
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), "GET", "/", nil)
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusRequestTimeout, w.Code)
+	assert.Equal(t, http.StatusText(http.StatusRequestTimeout), w.Body.String())
+
+	// Give the soft worker time to finish
+	time.Sleep(60 * time.Millisecond)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&done), "handler goroutine should continue after soft timeout")
 }
 
 /*
