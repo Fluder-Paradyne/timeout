@@ -117,6 +117,7 @@ func New(opts ...Option) gin.HandlerFunc {
 		case <-finish:
 			// Handler finished successfully: flush buffer to response and stop main chain
 			tw.mu.Lock()
+			defer tw.mu.Unlock()
 			dst := tw.ResponseWriter.Header()
 			for k, vv := range tw.Header() {
 				dst[k] = vv
@@ -129,7 +130,6 @@ func New(opts ...Option) gin.HandlerFunc {
 			}
 			tw.FreeBuffer()
 			bufPool.Put(buffer)
-			tw.mu.Unlock()
 
 			// Prevent the original chain from executing again
 			c.Abort()
