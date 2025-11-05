@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"runtime/debug"
 	"time"
 	"unsafe"
 
@@ -16,7 +17,11 @@ const (
 	defaultTimeout = 5 * time.Second
 )
 
-// panicInfo was used previously for cross-goroutine panic handling; no longer needed.
+// panicInfo transmits both the panic value and the stack trace when a handler panics.
+type panicInfo struct {
+	Value interface{}
+	Stack []byte
+}
 
 // New wraps a handler and aborts the process of the handler if the timeout is reached
 func New(opts ...Option) gin.HandlerFunc {
@@ -54,14 +59,14 @@ func New(opts ...Option) gin.HandlerFunc {
 
 		// Channels to coordinate completion, timeout, and panic
 		finish := make(chan struct{}, 1)
-		panicChan := make(chan interface{}, 1)
+		panicChan := make(chan panicInfo, 1)
 
 		// Run the remaining handlers asynchronously on the copied context with cancel support
 		stop := make(chan struct{})
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
-					panicChan <- r
+					panicChan <- panicInfo{Value: r, Stack: debug.Stack()}
 					return
 				}
 				finish <- struct{}{}
@@ -86,19 +91,26 @@ func New(opts ...Option) gin.HandlerFunc {
 		}()
 
 		select {
-		case r := <-panicChan:
-			// Handler panicked: respond with 500 similar to CustomRecovery behavior
+		case pi := <-panicChan:
+			// Handler panicked
 			tw.mu.Lock()
 			tw.FreeBuffer()
 			bufPool.Put(buffer)
 			tw.mu.Unlock()
 
-			w.WriteHeader(http.StatusInternalServerError)
-			// mirror the test expectation string
-			_, _ = w.Write([]byte("panic caught: "))
-			_, _ = w.Write([]byte(fmt.Sprint(r)))
-			c.Abort()
-			return
+			if gin.IsDebugging() {
+				// In debug mode, include stack trace for easier debugging
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte("panic caught: "))
+				_, _ = w.Write([]byte(fmt.Sprint(pi.Value)))
+				_, _ = w.Write([]byte("\n"))
+				_, _ = w.Write([]byte("Panic stack trace:\n"))
+				_, _ = w.Write(pi.Stack)
+				c.Abort()
+				return
+			}
+			// In non-debug mode, rethrow for upstream recovery middleware
+			panic(pi.Value)
 		case <-finish:
 			// Handler finished successfully: flush buffer to response and stop main chain
 			tw.mu.Lock()
