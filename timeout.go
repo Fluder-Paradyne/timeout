@@ -145,9 +145,9 @@ func New(opts ...Option) gin.HandlerFunc {
 			return
 		}
 
-		// Soft timeout path: run on copied context, no cancellation; drop late writes.
-		cCopy := c.Copy()
-		cCopy.Writer = tw
+		// Soft timeout path: run remaining handlers using copied context; no cancellation; drop late writes.
+		cc := *c
+		cc.Writer = tw
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -156,7 +156,16 @@ func New(opts ...Option) gin.HandlerFunc {
 				}
 				finish <- struct{}{}
 			}()
-			cCopy.Next()
+			rv := reflect.ValueOf(&cc).Elem()
+			handlersField := rv.FieldByName("handlers")
+			indexField := rv.FieldByName("index")
+
+			handlers := reflect.NewAt(handlersField.Type(), unsafe.Pointer(handlersField.UnsafeAddr())).Elem().Interface().(gin.HandlersChain)
+			idx := int(reflect.NewAt(indexField.Type(), unsafe.Pointer(indexField.UnsafeAddr())).Elem().Int())
+
+			for i := idx + 1; i < len(handlers); i++ {
+				handlers[i](&cc)
+			}
 		}()
 
 		select {
