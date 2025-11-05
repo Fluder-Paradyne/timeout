@@ -51,11 +51,22 @@ func New(opts ...Option) gin.HandlerFunc {
 		tw := NewWriter(w, buffer)
 		c.Writer = tw
 
-		// Make an isolated copy of the gin.Context struct so we can safely
-		// execute the remaining handlers in a separate goroutine without
-		// touching the original context flow control (index/handlers).
-		cc := *c
+		// Make a safe copy of the gin.Context for execution in another goroutine
+		// without copying the internal locks.
+		cc := c.Copy()
 		cc.Writer = tw
+		// Retrieve handlers and current index from the original context, and
+		// reattach them to the copied context so handler stepping works.
+		origRV := reflect.ValueOf(c).Elem()
+		origHandlersField := origRV.FieldByName("handlers")
+		origIndexField := origRV.FieldByName("index")
+		handlers := reflect.NewAt(origHandlersField.Type(), unsafe.Pointer(origHandlersField.UnsafeAddr())).Elem().Interface().(gin.HandlersChain)
+		idx := int(reflect.NewAt(origIndexField.Type(), unsafe.Pointer(origIndexField.UnsafeAddr())).Elem().Int())
+		ccRV := reflect.ValueOf(cc).Elem()
+		ccHandlersField := ccRV.FieldByName("handlers")
+		ccIndexField := ccRV.FieldByName("index")
+		reflect.NewAt(ccHandlersField.Type(), unsafe.Pointer(ccHandlersField.UnsafeAddr())).Elem().Set(reflect.ValueOf(handlers))
+		reflect.NewAt(ccIndexField.Type(), unsafe.Pointer(ccIndexField.UnsafeAddr())).Elem().SetInt(int64(idx))
 
 		// Channels to coordinate completion, timeout, and panic
 		finish := make(chan struct{}, 1)
@@ -72,21 +83,13 @@ func New(opts ...Option) gin.HandlerFunc {
 				finish <- struct{}{}
 			}()
 
-			rv := reflect.ValueOf(&cc).Elem()
-			handlersField := rv.FieldByName("handlers")
-			indexField := rv.FieldByName("index")
-
-			// Unsafe access to unexported fields
-			handlers := reflect.NewAt(handlersField.Type(), unsafe.Pointer(handlersField.UnsafeAddr())).Elem().Interface().(gin.HandlersChain)
-			idx := int(reflect.NewAt(indexField.Type(), unsafe.Pointer(indexField.UnsafeAddr())).Elem().Int())
-
 			for i := idx + 1; i < len(handlers); i++ {
 				select {
 				case <-stop:
 					return
 				default:
 				}
-				handlers[i](&cc)
+				handlers[i](cc)
 			}
 		}()
 
